@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>FishRespawn</AssemblyName>
+    <RootNamespace>FishRespawn</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <LibsDir>$(MSBuildProjectDirectory)/libs</LibsDir>
+    <!-- Unity DLLs reference netstandard 2.1; the conflict warning is harmless. -->
+    <MSBuildWarningsAsMessages>$(MSBuildWarningsAsMessages);MSB3277</MSBuildWarningsAsMessages>
+  </PropertyGroup>
+
+  <!-- Game/BepInEx assemblies, copied into ./libs by copy-libs.sh (or by hand). -->
+  <ItemGroup>
+    <Reference Include="BepInEx">
+      <HintPath>$(LibsDir)/BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="assembly_valheim">
+      <HintPath>$(LibsDir)/assembly_valheim.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="assembly_utils">
+      <HintPath>$(LibsDir)/assembly_utils.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(LibsDir)/UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(LibsDir)/UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Optional: if you pass -p:ValheimDir=..., copy the built DLL into BepInEx/plugins. -->
+  <Target Name="CopyToPlugins" AfterTargets="Build"
+          Condition="'$(ValheimDir)' != '' And Exists('$(ValheimDir)/BepInEx/plugins')">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ValheimDir)/BepInEx/plugins" />
+  </Target>
+
+</Project>
