@@ -12,25 +12,33 @@ namespace FishRespawn
     {
         public const string PluginGuid = "com.crborga.fishrespawn";
         public const string PluginName = "Fish Respawn";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.0.1";
 
+        // General
         private ConfigEntry<bool> _enabled;
+
+        // Spawn Area: where fish may appear
         private ConfigEntry<float> _radius;
         private ConfigEntry<float> _minSpawnDistance;
+        private ConfigEntry<float> _minWaterDepth;
+
+        // Spawn Rate: how many fish, and how often
         private ConfigEntry<int> _maxFishNearby;
         private ConfigEntry<float> _intervalSeconds;
         private ConfigEntry<int> _maxSpawnsPerTick;
-        private ConfigEntry<float> _minWaterDepth;
-        private ConfigEntry<float> _maxFishDepth;
+
+        // Fish: which fish spawn, and for how long
+        private ConfigEntry<bool> _biomeAccurate;
         private ConfigEntry<string> _fallbackFish;
         private ConfigEntry<float> _fishLifetime;
-        private ConfigEntry<bool> _biomeAccurate;
+
+        // Bait
         private ConfigEntry<bool> _anyBait;
 
-        private const float SurfaceClearance = 0.75f; // min distance below the water surface
-        private const float FloorClearance = 0.5f;    // min distance above the seabed
-
         private float _timer;
+        private float _baitTimer;
+        private bool _prefabsPatched;
+        private bool _wasFishing;
         private readonly List<SpawnedFish> _spawned = new List<SpawnedFish>();
 
         private struct SpawnedFish
@@ -48,27 +56,64 @@ namespace FishRespawn
 
         private void Awake()
         {
-            _enabled = Config.Bind("General", "Enabled", true, "Enable forced fish respawns while fishing.");
-            _radius = Config.Bind("General", "Radius", 30f, "Radius (m) around your fishing float to keep stocked with fish.");
-            _minSpawnDistance = Config.Bind("General", "MinSpawnDistance", 6f, "Fish never spawn closer than this (m) to the float, so they don't pop in on top of it.");
-            _maxFishNearby = Config.Bind("General", "MaxFishNearby", 8, "Stop spawning once this many fish are within Radius.");
-            _intervalSeconds = Config.Bind("General", "SpawnIntervalSeconds", 5f, "Seconds between respawn checks while your line is out.");
-            _maxSpawnsPerTick = Config.Bind("General", "MaxSpawnsPerCheck", 1, "Maximum fish spawned per check.");
-            _minWaterDepth = Config.Bind("Spawning", "MinWaterDepth", 2f, "Water must be at least this deep (m) at the spawn point.");
-            _maxFishDepth = Config.Bind("Spawning", "MaxFishDepth", 5f, "Fish spawn at most this far below the surface (m).");
-            _fallbackFish = Config.Bind("Spawning", "FallbackFish", "Fish1,Fish2",
-                "Comma-separated fish prefab names used when no biome fish data is available (or BiomeAccurate is off).");
-            _fishLifetime = Config.Bind("Spawning", "SpawnedFishLifetimeSeconds", 120f,
-                "Fish spawned by this mod are removed after this many seconds (unless hooked). 0 keeps them permanently.");
-            _biomeAccurate = Config.Bind("Spawning", "BiomeAccurate", true,
+            // General
+            _enabled = Config.Bind("General", "Enabled", true,
+                "Enable forced fish respawns while fishing.");
+
+            // Spawn Area
+            _radius = Config.Bind("Spawn Area", "Radius", 30f,
+                "Radius (m) around your fishing float to keep stocked with fish.");
+            _minSpawnDistance = Config.Bind("Spawn Area", "MinSpawnDistance", 6f,
+                "Fish never spawn closer than this (m) to the float, so they don't pop in on top of it.");
+            _minWaterDepth = Config.Bind("Spawn Area", "MinWaterDepth", 2f,
+                "Water must be at least this deep (m) at the spawn point (in addition to the fish's own minimum).");
+
+            // Spawn Rate
+            _maxFishNearby = Config.Bind("Spawn Rate", "MaxFishNearby", 8,
+                "Stop spawning once this many fish are within Radius.");
+            _intervalSeconds = Config.Bind("Spawn Rate", "SpawnIntervalSeconds", 5f,
+                "Seconds between respawn checks while your line is out.");
+            _maxSpawnsPerTick = Config.Bind("Spawn Rate", "MaxSpawnsPerCheck", 1,
+                "Maximum fish spawned per check.");
+
+            // Fish
+            _biomeAccurate = Config.Bind("Fish", "BiomeAccurate", true,
                 "Only spawn fish that the game itself spawns in the biome (and water depth) at the spawn point, using the game's spawn tables.");
+            _fallbackFish = Config.Bind("Fish", "FallbackFish", "Fish1,Fish2",
+                "Comma-separated fish prefab names used when no biome fish data is available (or BiomeAccurate is off).");
+            _fishLifetime = Config.Bind("Fish", "SpawnedFishLifetimeSeconds", 120f,
+                "Fish spawned by this mod are removed after this many seconds (unless hooked). 0 keeps them permanently.");
+
+            // Bait
             _anyBait = Config.Bind("Bait", "AnyBait", true,
                 "Let every fish be caught with any fishing bait, not just its preferred bait.");
         }
 
         private void Update()
         {
+            // Everything below only runs while you have a fishing float out (the game removes the float
+            // if you stop holding the rod), so the mod does nothing at all the rest of the time.
+            Player player = Player.m_localPlayer;
+            FishingFloat bobber = player != null ? FindOwnFloat(player) : null;
+
+            if (bobber == null)
+            {
+                if (_wasFishing)
+                {
+                    // Fishing just ended: clear out the fish this mod spawned, then go idle.
+                    _wasFishing = false;
+                    _timer = 0f;
+                    _baitTimer = 0f;
+                    RemoveAllSpawnedFish();
+                }
+
+                return;
+            }
+
+            _wasFishing = true;
+
             RemoveExpiredFish();
+            if (_anyBait.Value) UpdateAnyBait();
 
             if (!_enabled.Value) return;
 
@@ -76,7 +121,21 @@ namespace FishRespawn
             if (_timer < _intervalSeconds.Value) return;
             _timer = 0f;
 
-            TryRespawn();
+            TryRespawn(bobber);
+        }
+
+        // Removes every fish this mod spawned (used when you stop fishing).
+        private void RemoveAllSpawnedFish()
+        {
+            foreach (SpawnedFish tracked in _spawned)
+            {
+                if (tracked.Fish == null) continue;
+
+                if (ZNetScene.instance != null) ZNetScene.instance.Destroy(tracked.Fish.gameObject);
+                else Destroy(tracked.Fish.gameObject);
+            }
+
+            _spawned.Clear();
         }
 
         // Removes mod-spawned fish once their lifetime is up, but never one that is currently hooked.
@@ -102,13 +161,9 @@ namespace FishRespawn
             }
         }
 
-        private void TryRespawn()
+        private void TryRespawn(FishingFloat bobber)
         {
-            Player player = Player.m_localPlayer;
-            if (player == null || ZNetScene.instance == null || ZoneSystem.instance == null) return;
-
-            FishingFloat bobber = FindOwnFloat(player);
-            if (bobber == null) return;
+            if (ZNetScene.instance == null || ZoneSystem.instance == null) return;
 
             Vector3 center = bobber.transform.position;
             float sqrRadius = _radius.Value * _radius.Value;
@@ -121,7 +176,6 @@ namespace FishRespawn
                 Fish fish = updater as Fish;
                 if (fish == null || (fish.transform.position - center).sqrMagnitude > sqrRadius) continue;
                 count++;
-                if (anyBait) ApplyAnyBait(fish);
             }
 
             int toSpawn = Mathf.Min(_maxSpawnsPerTick.Value, _maxFishNearby.Value - count);
@@ -144,6 +198,32 @@ namespace FishRespawn
         }
 
         // Adds every fishing bait to the fish's accepted-bait list (existing entries are left alone).
+        // Gives every fish the extra baits: the prefabs once (so game-spawned fish start with them) and every
+        // loaded fish twice a second, independent of spawning, the float's radius or the respawn interval.
+        private void UpdateAnyBait()
+        {
+            if (!_prefabsPatched && ZNetScene.instance != null && ObjectDB.instance != null)
+            {
+                foreach (GameObject prefab in ZNetScene.instance.m_prefabs)
+                {
+                    Fish template = prefab != null ? prefab.GetComponent<Fish>() : null;
+                    if (template != null) ApplyAnyBait(template);
+                }
+
+                _prefabsPatched = true;
+            }
+
+            _baitTimer += Time.deltaTime;
+            if (_baitTimer < 0.5f) return;
+            _baitTimer = 0f;
+
+            foreach (IMonoUpdater updater in Fish.Instances)
+            {
+                Fish fish = updater as Fish;
+                if (fish != null) ApplyAnyBait(fish);
+            }
+        }
+
         private void ApplyAnyBait(Fish fish)
         {
             if (fish.m_baits == null || !_baitApplied.Add(fish.GetInstanceID())) return;
@@ -288,10 +368,9 @@ namespace FishRespawn
         private bool TryPickSpawn(Vector3 center, out GameObject prefab, out Vector3 result)
         {
             float waterLevel = ZoneSystem.instance.m_waterLevel;
-            float minWater = Mathf.Max(_minWaterDepth.Value, SurfaceClearance + FloorClearance);
+            float minWater = _minWaterDepth.Value;
             float minDist = _minSpawnDistance.Value;
             float maxDist = Mathf.Max(minDist + 1f, _radius.Value);
-            float depthCap = Mathf.Max(SurfaceClearance, _maxFishDepth.Value);
 
             for (int attempt = 0; attempt < 15; attempt++)
             {
@@ -306,15 +385,15 @@ namespace FishRespawn
                 GameObject candidate = PickPrefabAt(p, depth);
                 if (candidate == null) continue;
 
-                // Fish only pick swim waypoints where the water depth is inside their own m_minDepth..m_maxDepth.
+                // Use the same depth rule the game's own Fish.RandomizeWaypoint uses, so a fish spawns at the
+                // depth it would normally swim at: waterLevel - Random(m_minDepth, min(m_maxDepth, waterDepth - m_height)).
                 Fish template = candidate.GetComponent<Fish>();
-                if (template != null && (depth < template.m_minDepth || (template.m_maxDepth > 0f && depth > template.m_maxDepth))) continue;
+                if (template == null || depth < template.m_minDepth) continue; // the game rejects such spots too
 
-                // Never deeper than the user's cap or than the floor clearance allows.
-                float maxDepth = Mathf.Min(depthCap, depth - FloorClearance);
-                if (maxDepth < SurfaceClearance) continue; // too shallow for a fish here
+                float deepest = Mathf.Min(template.m_maxDepth, depth - template.m_height);
+                if (deepest < template.m_minDepth) continue; // no room for this fish between surface and seabed
 
-                float fishDepth = Random.Range(SurfaceClearance, maxDepth);
+                float fishDepth = Random.Range(template.m_minDepth, deepest);
                 prefab = candidate;
                 result = new Vector3(p.x, waterLevel - fishDepth, p.z);
                 return true;
