@@ -12,7 +12,7 @@ namespace FishRespawn
     {
         public const string PluginGuid = "com.crborga.fishrespawn";
         public const string PluginName = "Fish Respawn";
-        public const string PluginVersion = "1.0.1";
+        public const string PluginVersion = "1.0.2";
 
         // General
         private ConfigEntry<bool> _enabled;
@@ -20,7 +20,6 @@ namespace FishRespawn
         // Spawn Area: where fish may appear
         private ConfigEntry<float> _radius;
         private ConfigEntry<float> _minSpawnDistance;
-        private ConfigEntry<float> _minWaterDepth;
 
         // Spawn Rate: how many fish, and how often
         private ConfigEntry<int> _maxFishNearby;
@@ -35,6 +34,7 @@ namespace FishRespawn
         // Bait
         private ConfigEntry<bool> _anyBait;
 
+        private FishingFloat _bobber; // cached so we don't scan every float each frame
         private float _timer;
         private float _baitTimer;
         private bool _prefabsPatched;
@@ -50,6 +50,7 @@ namespace FishRespawn
         private bool _fishSpawnsLoaded;
         private readonly List<GameObject> _biomeCandidates = new List<GameObject>();
         private readonly List<ItemDrop> _allBaits = new List<ItemDrop>();
+        private bool _baitsLoaded;
         private readonly HashSet<int> _baitApplied = new HashSet<int>(); // instance IDs already given extra baits
         private readonly List<GameObject> _fallbackPrefabs = new List<GameObject>();
         private string _cachedFallbackString;
@@ -65,8 +66,6 @@ namespace FishRespawn
                 "Radius (m) around your fishing float to keep stocked with fish.");
             _minSpawnDistance = Config.Bind("Spawn Area", "MinSpawnDistance", 6f,
                 "Fish never spawn closer than this (m) to the float, so they don't pop in on top of it.");
-            _minWaterDepth = Config.Bind("Spawn Area", "MinWaterDepth", 2f,
-                "Water must be at least this deep (m) at the spawn point (in addition to the fish's own minimum).");
 
             // Spawn Rate
             _maxFishNearby = Config.Bind("Spawn Rate", "MaxFishNearby", 8,
@@ -94,7 +93,9 @@ namespace FishRespawn
             // Everything below only runs while you have a fishing float out (the game removes the float
             // if you stop holding the rod), so the mod does nothing at all the rest of the time.
             Player player = Player.m_localPlayer;
-            FishingFloat bobber = player != null ? FindOwnFloat(player) : null;
+            if (player == null) _bobber = null;
+            else if (_bobber == null) _bobber = FindOwnFloat(player); // Unity null: also true once destroyed
+            FishingFloat bobber = _bobber;
 
             if (bobber == null)
             {
@@ -128,14 +129,15 @@ namespace FishRespawn
         private void RemoveAllSpawnedFish()
         {
             foreach (SpawnedFish tracked in _spawned)
-            {
-                if (tracked.Fish == null) continue;
-
-                if (ZNetScene.instance != null) ZNetScene.instance.Destroy(tracked.Fish.gameObject);
-                else Destroy(tracked.Fish.gameObject);
-            }
+                if (tracked.Fish != null) DestroyFish(tracked.Fish);
 
             _spawned.Clear();
+        }
+
+        private static void DestroyFish(Fish fish)
+        {
+            if (ZNetScene.instance != null) ZNetScene.instance.Destroy(fish.gameObject);
+            else Destroy(fish.gameObject);
         }
 
         // Removes mod-spawned fish once their lifetime is up, but never one that is currently hooked.
@@ -155,18 +157,21 @@ namespace FishRespawn
 
                 if (now < _spawned[i].ExpiresAt || fish.IsHooked()) continue;
 
-                if (ZNetScene.instance != null) ZNetScene.instance.Destroy(fish.gameObject);
-                else Destroy(fish.gameObject);
+                DestroyFish(fish);
                 _spawned.RemoveAt(i);
             }
         }
+
+        // Outer spawn radius. Always at least 1 m beyond MinSpawnDistance, and used for both counting and spawning
+        // so fish never spawn outside the area that is counted against MaxFishNearby.
+        private float OuterRadius => Mathf.Max(_minSpawnDistance.Value + 1f, _radius.Value);
 
         private void TryRespawn(FishingFloat bobber)
         {
             if (ZNetScene.instance == null || ZoneSystem.instance == null) return;
 
             Vector3 center = bobber.transform.position;
-            float sqrRadius = _radius.Value * _radius.Value;
+            float sqrRadius = OuterRadius * OuterRadius;
             bool anyBait = _anyBait.Value;
 
             // Count fish already around the float (Fish.Instances is the game's own list, so no scene scan).
@@ -259,7 +264,8 @@ namespace FishRespawn
 
         private void RefreshAllBaits()
         {
-            if (_allBaits.Count > 0 || ObjectDB.instance == null) return;
+            if (_baitsLoaded || ObjectDB.instance == null) return;
+            _baitsLoaded = true;
 
             foreach (GameObject item in ObjectDB.instance.m_items)
             {
@@ -368,9 +374,8 @@ namespace FishRespawn
         private bool TryPickSpawn(Vector3 center, out GameObject prefab, out Vector3 result)
         {
             float waterLevel = ZoneSystem.instance.m_waterLevel;
-            float minWater = _minWaterDepth.Value;
             float minDist = _minSpawnDistance.Value;
-            float maxDist = Mathf.Max(minDist + 1f, _radius.Value);
+            float maxDist = OuterRadius;
 
             for (int attempt = 0; attempt < 15; attempt++)
             {
@@ -380,7 +385,7 @@ namespace FishRespawn
 
                 float ground = ZoneSystem.instance.GetGroundHeight(p);
                 float depth = waterLevel - ground;
-                if (depth < minWater) continue;
+                if (depth <= 0f) continue; // land, no fish here
 
                 GameObject candidate = PickPrefabAt(p, depth);
                 if (candidate == null) continue;
